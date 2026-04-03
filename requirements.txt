@@ -1,4 +1,3 @@
-python-telegram-bot
 matplotlib
-pandas
-numpy
+requests
+websocket-client
