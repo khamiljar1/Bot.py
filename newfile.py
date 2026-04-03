@@ -1,17 +1,21 @@
+import os
+import sys
+
+# রেলওয়েতে ফাইল ছাড়া অটোমেশনের জন্য লাইব্রেরি অটো-ইনস্টল করার ট্রিক
+try:
+    import numpy as np
+    import pandas as pd
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, KeyboardButton
+    from telegram.ext import Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters
+except ImportError:
+    print("Installing required libraries on Railway...")
+    os.system("pip install python-telegram-bot==20.8 numpy pandas")
+    print("Installation complete. Restarting script...")
+    os.execv(sys.executable, ['python'] + sys.argv)
+
 import asyncio
-import numpy as np
-import pandas as pd
 import json
 import urllib.request
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update, ReplyKeyboardMarkup, KeyboardButton
-from telegram.ext import (
-    Application,
-    CallbackQueryHandler,
-    CommandHandler,
-    ContextTypes,
-    MessageHandler,
-    filters,
-)
 
 # ==========================================
 # 🔑 CONFIGURATION & CREDENTIALS
@@ -19,62 +23,46 @@ from telegram.ext import (
 TOKEN = "8573216613:AAHenpEHoGeRRU2GhhAHlChA7wz6yPugPag"
 CHAT_ID = "8283358607"
 
-# Indicator Settings (Pivot + ATR)
 LENGTH = 14
 ATR_LEN = 14
 
-# মাল্টিপল টাইমফ্রেম হ্যান্ডেল করার জন্য ডিকশনারি
-active_scans = {}  # {timeframe: True/False}
-active_alerts = {} # {timeframe: True/False}
+active_scans = {}  
+active_alerts = {} 
 
 monitored_assets = [
-    # 🌍 Forex & Metals (Total 10)
     "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X", 
     "AUDUSD=X", "AUDCAD=X", "GC=F", "SI=F", "USOIL", "NZDUSD=X",
-    
-    # 🪙 Crypto (Total 10)
     "BTC-USD", "ETH-USD", "BNB-USD", "SOL-USD", "XRP-USD", 
     "ADA-USD", "DOGE-USD", "DOT-USD", "MATIC-USD", "TRX-USD"
 ]
 
-# ==========================================
-# ⌨️ পার্মানেন্ট রিপ্লাই কিবোর্ড (কখনোই হাইড হবে না)
-# ==========================================
 def get_permanent_keyboard():
     return ReplyKeyboardMarkup(
         [[KeyboardButton("🏠 Home")]], 
         resize_keyboard=True, 
-        one_time_keyboard=False, # বাটন চাপার পর গায়েব হবে না
-        is_persistent=True       # সবসময় স্থায়ীভাবে নিচে শো করবে
+        one_time_keyboard=False,
+        is_persistent=True       
     )
 
-# ==========================================
-# 📊 12-FACTOR SWING TRADING LOGIC
-# ==========================================
-
 def calculate_indicators(df):
-    if len(df) < 50: # সুইং ট্রেডিং এর জন্য একটু বেশি ডাটা দরকার হয়
+    if len(df) < 50: 
         return None, None, None, None, None
 
-    # ১. Exponential Moving Averages (EMA)
     df['ema8'] = df['close'].ewm(span=8, adjust=False).mean()
     df['ema21'] = df['close'].ewm(span=21, adjust=False).mean()
     df['ema50'] = df['close'].ewm(span=50, adjust=False).mean()
     
-    # ২. Relative Strength Index (RSI)
     delta = df['close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
     rs = gain / loss
     df['rsi'] = 100 - (100 / (1 + rs))
     
-    # ৩. MACD
     exp1 = df['close'].ewm(span=12, adjust=False).mean()
     exp2 = df['close'].ewm(span=26, adjust=False).mean()
     df['macd'] = exp1 - exp2
     df['signal_line'] = df['macd'].ewm(span=9, adjust=False).mean()
     
-    # ৪. Bollinger Bands & ATR
     df['sma20'] = df['close'].rolling(window=20).mean()
     df['std20'] = df['close'].rolling(window=20).std()
     df['upper_bb'] = df['sma20'] + (df['std20'] * 2)
@@ -86,78 +74,58 @@ def calculate_indicators(df):
     df["tr"] = df[["high_low", "high_cp", "low_cp"]].max(axis=1)
     df["atr"] = df["tr"].rolling(window=ATR_LEN).mean()
 
-    # ৫. Stochastic Oscillator
     low_14 = df['low'].rolling(window=14).min()
     high_14 = df['high'].rolling(window=14).max()
     df['k_percent'] = 100 * ((df['close'] - low_14) / (high_14 - low_14))
     df['d_percent'] = df['k_percent'].rolling(window=3).mean()
 
-    # ডাটা এভেইলেবল করার জন্য ৩টি ক্যান্ডেল পেছনের ডাটা দেখা হচ্ছে
     last_row = df.iloc[-1]
     prev_row = df.iloc[-2]
     
-    # প্রফেশনাল স্কোরিং সিস্টেম (মোট ১২ পয়েন্ট)
     buy_score = 0
     sell_score = 0
     
-    # Factor 1: Trend Alignment (EMA 8 > EMA 21)
     if last_row['ema8'] > last_row['ema21']: buy_score += 1
     if last_row['ema8'] < last_row['ema21']: sell_score += 1
     
-    # Factor 2: Pullback Support (Close above EMA 50)
     if last_row['close'] > last_row['ema50']: buy_score += 1
     if last_row['close'] < last_row['ema50']: sell_score += 1
     
-    # Factor 3: Momentum Shift (RSI crossing above 50 or below 50)
     if last_row['rsi'] > 50 and prev_row['rsi'] <= 50: buy_score += 1
     if last_row['rsi'] < 50 and prev_row['rsi'] >= 50: sell_score += 1
     
-    # Factor 4: RSI Extremes (Not overbought/oversold for safety in swing)
     if 40 < last_row['rsi'] < 70: buy_score += 1
     if 30 < last_row['rsi'] < 60: sell_score += 1
     
-    # Factor 5: MACD Crossover
     if last_row['macd'] > last_row['signal_line'] and prev_row['macd'] <= prev_row['signal_line']: buy_score += 1
     if last_row['macd'] < last_row['signal_line'] and prev_row['macd'] >= prev_row['signal_line']: sell_score += 1
     
-    # Factor 6: MACD Zero Line
     if last_row['macd'] > 0: buy_score += 1
     if last_row['macd'] < 0: sell_score += 1
     
-    # Factor 7: Bollinger Band Bounce / Expansion
     if last_row['close'] > last_row['sma20']: buy_score += 1
     if last_row['close'] < last_row['sma20']: sell_score += 1
     
-    # Factor 8: Candlestick Pattern (Bullish/Bearish Engulfing simple check)
     if last_row['close'] > prev_row['open'] and last_row['open'] < prev_row['close']: buy_score += 1
     if last_row['close'] < prev_row['open'] and last_row['open'] > prev_row['close']: sell_score += 1
     
-    # Factor 9: Stochastic Bullish/Bearish Cross
     if last_row['k_percent'] > last_row['d_percent'] and prev_row['k_percent'] <= prev_row['d_percent']: buy_score += 1
     if last_row['k_percent'] < last_row['d_percent'] and prev_row['k_percent'] >= prev_row['d_percent']: sell_score += 1
     
-    # Factor 10: Stochastic Zone
     if last_row['k_percent'] > 20: buy_score += 1
     if last_row['k_percent'] < 80: sell_score += 1
     
-    # Factor 11: Price Action (Higher High / Lower Low)
     if last_row['high'] > prev_row['high']: buy_score += 1
     if last_row['low'] < prev_row['low']: sell_score += 1
     
-    # Factor 12: Price Momentum (Last 3 closes rising or falling)
     if len(df) >= 3:
         if df['close'].iloc[-1] > df['close'].iloc[-2] > df['close'].iloc[-3]: buy_score += 1
         if df['close'].iloc[-1] < df['close'].iloc[-2] < df['close'].iloc[-3]: sell_score += 1
 
-    # এআই প্রফেশনাল স্কোর ১২ পয়েন্ট পূর্ণ হলেই কেবল সিগন্যাল ট্রিগার হবে
     buy_signal = (buy_score >= 12)
     sell_signal = (sell_score >= 12)
 
     return buy_signal, sell_signal, last_row["close"], last_row["atr"], df
-
-# ==========================================
-# 🕵️‍♂️ DIRECT API FETCHER & ENGINES
-# ==========================================
 
 def fetch_live_data(symbol, timeframe):
     interval = timeframe
@@ -165,7 +133,6 @@ def fetch_live_data(symbol, timeframe):
     elif timeframe == "2h": interval = "120m"
     elif timeframe == "4h": interval = "240m"
     
-    # সুইং ট্রেডিং এর জন্য 1d ডাটা এনাফ না হতে পারে, তাই রেঞ্জ বাড়িয়ে ৫ দিন (5d) করা হলো
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}?interval={interval}&range=5d"
     headers = {'User-Agent': 'Mozilla/5.0'}
     
@@ -198,7 +165,6 @@ async def single_asset_engine(symbol, timeframe, app):
                 await asyncio.sleep(5)
                 continue
 
-            # সিগন্যাল ক্যালকুলেশন
             buy, sell, ep, atr, full_df = calculate_indicators(df)
             clean_symbol = symbol.replace("=X", "").replace("=F", "").replace("-USD", "/USD").replace("GC", "GOLD").replace("SI", "SILVER")
 
@@ -258,10 +224,6 @@ async def spam_reminder(app, timeframe):
         )
         await asyncio.sleep(5)
 
-# ==========================================
-# 🤖 TELEGRAM BOT INTERACTION & MENUS
-# ==========================================
-
 def get_home_markup():
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📈 Start Trading", callback_data="menu_trading")],
@@ -270,31 +232,26 @@ def get_home_markup():
     ])
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # হোম ড্যাশবোর্ড দেখানোর সময়ও আমরা নিচের পার্মানেন্ট কিবোর্ডটি পুশ করে দিচ্ছি
     await update.message.reply_text(
         "Welcome! I am your personal AI Trading Agent. I will scan the market "
         "and find perfect signals based on your custom logic. Tap below to start.",
         reply_markup=get_home_markup(),
     )
-    # বাটনটি পুশ করে দেওয়া হলো
     await update.message.reply_text("হোম বাটন নিচে পার্মানেন্টলি সেট করা হয়েছে।", reply_markup=get_permanent_keyboard())
 
 async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
 
-    # ইনলাইন বাটনে চাপ দিলে নিচের বাটনটি হাইড হতে চায়, তাই এখানেও কিবোর্ডটি আবার রিপ্লাই কিবোর্ড হিসেবে জুড়ে দেওয়া হয়েছে।
     p_keyboard = get_permanent_keyboard()
 
     if query.data == "home":
-        # edit_message_text এ ReplyKeyboardMarkup সাপোর্ট করে না, তাই ডিলিট করে নতুন করে পাঠানো হচ্ছে যাতে বাটন ওপেন থাকে।
         await query.message.delete()
         await context.bot.send_message(
             chat_id=CHAT_ID,
             text="Welcome! I am your personal AI Trading Agent. I will scan the market and find perfect signals based on your custom logic. Tap below to start.",
             reply_markup=get_home_markup()
         )
-        # বাটন ফিক্স রাখার জন্য পুশ
         await context.bot.send_message(chat_id=CHAT_ID, text="হোম বাটন লোড করা আছে।", reply_markup=p_keyboard)
 
     elif query.data == "menu_info":
@@ -331,7 +288,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text="Please select your preferred timeframe. I will start analyzing the data accordingly.", 
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
-        # কিবোর্ড ধরে রাখার জন্য মেসেজ
         await context.bot.send_message(chat_id=CHAT_ID, text="হোম বাটন ফিক্সড আছে।", reply_markup=p_keyboard)
 
     elif query.data.startswith("tf_"):
